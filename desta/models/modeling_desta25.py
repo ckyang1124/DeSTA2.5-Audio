@@ -364,7 +364,7 @@ class DeSTA25AudioModel(PreTrainedModel):
 
         return inputs_embeds
         
-    def state_dict(self):
+    def state_dict(self, destination=None, prefix="", keep_vars=False):
         """
         Only return "trainable" parameters, since most of the parameters are frozen
         """
@@ -675,3 +675,158 @@ class DeSTA25AudioModel(PreTrainedModel):
                 audios=[],
                 generated_ids=generated_ids_list
             )
+    
+    def process_before_forward(self, messages):
+        if not hasattr(self, "tokenizer"):
+            self._setup_generation()
+
+        if isinstance(messages, list):
+            if isinstance(messages[0], dict):
+                messages_list = [messages]
+            else: 
+                messages_list = messages
+        else:
+            raise ValueError("messages should be a list of dictionaries or a list of lists.")
+
+        all_audios = []
+        all_transcriptions = []
+        for messages in messages_list:
+            for message in messages:
+                content = message["content"]
+                audios = message.get("audios", [])
+                assert len(audios) == content.count(self.audio_locator), "audio count does not match (<|AUDIO|>) count"
+
+                for audio in audios:
+                    all_audios.append(audio["audio"])
+                    all_transcriptions.append(audio.get("text"))
+
+        if len(all_audios) > 0:
+            """
+            If audios are provided, run:
+            1. get features and transcription
+            2. prepare LLM inputs
+            3. run generation
+            """
+
+            batch_features = []
+            asr_features = []
+            asr_indices = []
+            for i, (audio, trans) in enumerate(zip(all_audios, all_transcriptions)):
+                if not os.path.exists(audio):
+                    raise ValueError(f"Audio file {audio} does not exist.")
+
+                # Extract audio features
+                feature = AudioSegment.from_file(
+                    audio,
+                    target_sr=16000,
+                    channel_selector="average"
+                ).samples
+
+                batch_features.append(feature)
+
+                # Run VAD detect if there is speech in the audio
+                is_speech = self.get_speech_timestamps(feature, self.vad_model)
+                if is_speech and trans is None:
+                    asr_features.append(feature)
+                    asr_indices.append(i)
+                if not is_speech:
+                    all_transcriptions[i] = " "
+            
+            batch_features = self.processor(batch_features, sampling_rate=16000, return_tensors="pt").input_features
+            batch_features = batch_features.to(self.device)
+            audio_size_list = [self.config.prompt_size] * len(batch_features)
+
+
+            # RUN ASR
+            if asr_features:
+                asr_features = self.processor(asr_features, sampling_rate=16000, return_tensors="pt").input_features
+                asr_features = asr_features.to(self.device)
+
+                transcriptions = self.perception.whisper.generate(
+                    input_features=asr_features,
+                    attention_mask=None,
+                    max_new_tokens=128
+                )
+                transcriptions = self.processor.batch_decode(
+                    transcriptions,
+                    skip_special_tokens=True,
+                )
+            
+            else:
+                # no audio needs ASR result
+                transcriptions = []
+
+            
+            for i, transcription in zip(asr_indices, transcriptions):
+                all_transcriptions[i] = transcription.strip()
+                    
+            transcription_size_list = [
+                len(self.tokenizer.tokenize(text, add_special_tokens=False)) for text in all_transcriptions
+            ]
+
+
+            audio_context_list = []
+            start_positions_list = []
+            for messages in messages_list:
+                audio_context = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+
+                # <start_audio><|AUDIO|><end_audio> is a indicator used in the training stage
+                # We replace <|AUDIO|> with <start_audio><|AUDIO|><end_audio> here
+                audio_context = audio_context.replace(self.audio_locator, f"<start_audio>{self.audio_locator}<end_audio>")
+
+                audio_context, start_positions = _prepare_audio_context_and_start_positions(
+                        token_list=self.tokenizer.tokenize(audio_context), 
+                        audio_locator=self.audio_locator,
+                        audio_size_list=audio_size_list,
+                        transcription_size_list=transcription_size_list,
+                        placeholder_token=self.placeholder_token
+                    )
+
+
+                audio_context = self.tokenizer.convert_tokens_to_string(audio_context)
+                audio_context_list.append(audio_context)
+
+                start_positions_list.append(start_positions)
+
+
+            audio_context_inputs = self.tokenizer(
+                audio_context_list,
+                truncation=True,
+                padding="longest",
+                return_tensors="pt",
+                return_length=True,
+                add_special_tokens=False,
+            )
+
+            audio_context_batch_start_positions = []
+            for i in range(audio_context_inputs["length"].size(0)):
+                total_length = audio_context_inputs["length"][i]
+                pad_length = total_length - audio_context_inputs["attention_mask"][i].sum()
+
+                for start_position in start_positions_list[i]:
+                    audio_context_batch_start_positions.append((i, start_position + pad_length))
+
+            batch_transcription_ids = []
+            for transcription in all_transcriptions:
+                batch_transcription_ids.append(
+                    self.tokenizer.encode(transcription, add_special_tokens=False, return_tensors="pt").long().to(self.device)
+                )
+
+            inputs = {
+                "batch_features": batch_features,
+                "batch_transcription_ids": batch_transcription_ids,
+
+                "input_ids": audio_context_inputs["input_ids"],
+                "attention_mask": audio_context_inputs['attention_mask'],
+                "batch_start_positions": audio_context_batch_start_positions,
+            }
+            inputs = {
+                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                for k, v in inputs.items()
+            }
+            
+            return inputs
