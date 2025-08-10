@@ -277,13 +277,17 @@ class DeSTA25AudioModel(PreTrainedModel):
                 labels=None,
                 **kwargs):
         
-        inputs_embeds = self._prepare_inputs_for_llm(
-            input_ids=input_ids, 
-            attention_mask=attention_mask, 
-            batch_features=batch_features,
-            batch_transcription_ids=batch_transcription_ids, 
-            batch_start_positions=batch_start_positions
-        )
+        if batch_features is None or len(batch_features) == 0:
+            # no audio, just return the input_ids embeddings
+            inputs_embeds = self.llm_model.model.embed_tokens(input_ids)
+        else:
+            inputs_embeds = self._prepare_inputs_for_llm(
+                input_ids=input_ids, 
+                attention_mask=attention_mask, 
+                batch_features=batch_features,
+                batch_transcription_ids=batch_transcription_ids, 
+                batch_start_positions=batch_start_positions
+            )
 
 
         outputs = self.llm_model(
