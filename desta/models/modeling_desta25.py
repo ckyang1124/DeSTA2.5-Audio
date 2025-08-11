@@ -233,10 +233,20 @@ class DeSTA25Config(PretrainedConfig):
 
 class DeSTA25AudioModel(PreTrainedModel):
     config_class = DeSTA25Config
+    _no_split_modules = [
+        "LlamaDecoderLayer", 
+        "WhisperDecoderLayer", 
+        "WhisperEncoder",
+        "WhisperDecoder", 
+        "QformerConnector",
+        "WhisperPerception",
+        "BertLayer"
+    ]
+    # _keep_in_fp32_modules = ["layer_norm"]
+
 
     def __init__(self, config, cache_dir=None, token=None, **kwargs):
         super().__init__(config, **kwargs)
-
         self.config = config
 
         token = token if token else os.getenv("HF_TOKEN")
@@ -268,6 +278,36 @@ class DeSTA25AudioModel(PreTrainedModel):
         self.perception = WhisperPerception(self.config)
 
         self.configure_trainable_parameters()
+        
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        # Remove device_map temporarily to avoid meta device issues
+        device_map = kwargs.pop("device_map", None)
+        
+        # Load model without device_map first
+        model = super().from_pretrained(
+            pretrained_model_name_or_path, 
+            *model_args, 
+            **kwargs
+        )
+        
+        # If we need multi-GPU, manually dispatch the model
+        if device_map == "auto" and torch.cuda.device_count() > 1:
+            try:
+                from accelerate import dispatch_model, infer_auto_device_map
+                device_map = infer_auto_device_map(
+                    model, 
+                    max_memory={i: "20GiB" for i in range(torch.cuda.device_count())}, # TODO: is 20GB okay?
+                    no_split_module_classes=cls._no_split_modules
+                )
+                model = dispatch_model(model, device_map=device_map)
+            except Exception as e:
+                print(f"Failed to auto-dispatch model: {e}")
+                model = model.cuda()
+        elif device_map == "auto":
+            model = model.cuda()
+        
+        return model
 
     def forward(self, input_ids,
                 attention_mask, 
@@ -346,6 +386,12 @@ class DeSTA25AudioModel(PreTrainedModel):
 
             # get transcription embeddings
             transcription_embeddings = transcription_embeddings_list[audio_batch_idx] # (length, dim)
+            
+            # Multi-GPU support
+            # Ensure tensors are on the same device
+            # Move audio_features to the same device as transcription_embeddings
+            target_device = transcription_embeddings.device
+            audio_features = audio_features.to(target_device)
 
             # # concat the speech features and transcription embeddings
             audio_embeddings = torch.cat([audio_features, transcription_embeddings], dim=0)
@@ -355,6 +401,12 @@ class DeSTA25AudioModel(PreTrainedModel):
             # # replace the input_embeds with the audio features
             # # [---- Other text embeddings ----][---- audio features + transcription embeddings ----][---- Other text embeddings ----]
             target_slice = slice(audio_start_position, audio_start_position + audio_embeddings.size(0))
+            
+            # Multi-GPU support
+            # Ensure audio_embeddings are on the same device as inputs_embeds
+            inputs_embeds_device = inputs_embeds.device
+            audio_embeddings = audio_embeddings.to(inputs_embeds_device)
+            
             inputs_embeds[text_batch_idx, target_slice] = audio_embeddings
             
 
