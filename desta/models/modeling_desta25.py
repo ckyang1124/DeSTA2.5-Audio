@@ -407,7 +407,13 @@ class DeSTA25AudioModel(PreTrainedModel):
             inputs_embeds_device = inputs_embeds.device
             audio_embeddings = audio_embeddings.to(inputs_embeds_device)
             
-            inputs_embeds[text_batch_idx, target_slice] = audio_embeddings
+            if target_slice.stop > inputs_embeds.size(1):
+                # truncate the slice if it exceeds the input embeds length
+                logging.warning(f"audio_embeddings size {audio_embeddings.size(0)} exceeds input_embeds size {inputs_embeds.size(1)} at text_batch_idx {text_batch_idx}. Truncating the slice.")
+                target_slice = slice(target_slice.start, inputs_embeds.size(1))
+                inputs_embeds[text_batch_idx, target_slice] = audio_embeddings[:target_slice.stop - target_slice.start]
+            else:
+                inputs_embeds[text_batch_idx, target_slice] = audio_embeddings
             
 
 
